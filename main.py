@@ -1,202 +1,146 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+import asyncio
+import re
+from collections import deque
+from typing import Dict
+
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from typing import Dict
-from datetime import datetime
-import time
-import asyncio
+from astrbot.core import AstrBotConfig
+from astrbot.core.message.components import Plain
+
+
+class SessionState:
+    """会话状态管理"""
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.sent_messages = deque(maxlen=20)  # 最多保留20条消息ID
+        self.pending_recalls = []  # 待撤回的消息ID列表
+
+
+class StateManager:
+    """全局状态管理器"""
+    _sessions: Dict[str, SessionState] = {}
+
+    @classmethod
+    def get_session(cls, session_id: str) -> SessionState:
+        if session_id not in cls._sessions:
+            cls._sessions[session_id] = SessionState(session_id)
+        return cls._sessions[session_id]
+
 
 @register("chat_pro", "Twinkle", "AstrBot 多功能插件 - 支持 LLM 自主撤回消息", "1.0.0")
 class ChatProPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        # 存储最近发送的消息 ID，格式: {unified_msg_origin: [(message_id, timestamp), ...]}
-        self.sent_messages: Dict[str, list] = {}
-        # 最多保留每个会话的最近 20 条消息记录
-        self.max_messages_per_session = 20
+        self.config = config
 
-    async def initialize(self):
-        """插件初始化"""
-        logger.info("ChatPro 插件已初始化 - LLM 自主撤回功能已启用")
-        logger.info("AI 可以通过发送 [recall] 来撤回上一条消息")
+    @filter.on_decorating_result()
+    async def detect_and_process_recall(self, event: AstrMessageEvent):
+        """在消息发送前检测并处理 [recall] 标记"""
+        result = event.get_result()
+        if not result or not result.chain:
+            return
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def detect_recall_keyword(self, event: AstrMessageEvent):
-        """检测 AI 发送的 [recall] 关键词并自动撤回上一条消息"""
-        message_str = event.message_str.strip()
-        
-        # 检查是否是 [recall] 关键词
-        if message_str.lower() == "[recall]":
-            umo = event.unified_msg_origin
-            platform_name = event.get_platform_name()
-            
-            # 检查是否支持撤回功能
-            if platform_name not in ["aiocqhttp"]:
-                logger.warning(f"当前平台 {platform_name} 暂不支持消息撤回功能")
-                return
-            
-            # 检查是否有消息记录
-            if umo not in self.sent_messages or len(self.sent_messages[umo]) < 2:
-                logger.warning("没有足够的消息记录可以撤回")
-                return
-            
-            try:
-                # 获取最后两条消息 ID
-                # -1 是当前的 [recall] 消息，-2 是要撤回的上一条消息
-                if len(self.sent_messages[umo]) >= 2:
-                    recall_msg_id = self.sent_messages[umo][-1][0]  # [recall] 消息本身
-                    target_msg_id = self.sent_messages[umo][-2][0]  # 要撤回的上一条消息
-                    
-                    # 调用 QQ 协议端 API 撤回消息
+        # 只处理最后一个Plain组件
+        if not result.chain or not isinstance(result.chain[-1], Plain):
+            return
+
+        seg = result.chain[-1]
+        text = seg.text
+
+        # 检查是否包含 [recall] 标记（不区分大小写）
+        if '[recall]' in text.lower():
+            logger.info(f"检测到 [recall] 标记: {text}")
+
+            # 移除 [recall] 标记
+            cleaned_text = re.sub(r'\[recall\]', '', text, flags=re.IGNORECASE).strip()
+
+            if cleaned_text:
+                # 更新消息内容
+                seg.text = cleaned_text
+                logger.info(f"将发送并撤回消息: {cleaned_text}")
+
+                # 标记需要撤回
+                event._need_recall = True
+            else:
+                # 如果移除后没内容，阻止发送
+                event.set_result(event.plain_result(""))
+                logger.info("移除 [recall] 后无内容，已阻止发送")
+
+    @filter.after_message_sent()
+    async def handle_recall_after_sent(self, event: AstrMessageEvent):
+        """消息发送后处理撤回逻辑"""
+        # 只处理QQ平台
+        if event.get_platform_name() != "aiocqhttp":
+            return
+
+        # 检查是否需要撤回
+        if not hasattr(event, '_need_recall') or not event._need_recall:
+            return
+
+        try:
+            # 尝试获取message_id
+            message_id = None
+            result = event.get_result()
+
+            # 方法1: 从result.metadata获取
+            if result and hasattr(result, 'metadata') and result.metadata:
+                message_id = result.metadata.get('message_id')
+                if message_id:
+                    logger.info(f"从 metadata 获取到 message_id: {message_id}")
+
+            # 方法2: 从message_obj获取
+            if not message_id and hasattr(event, 'message_obj'):
+                message_id = getattr(event.message_obj, 'message_id', None)
+                if message_id:
+                    logger.info(f"从 message_obj 获取到 message_id: {message_id}")
+
+            if message_id:
+                # 等待消息发送完成
+                await asyncio.sleep(0.5)
+
+                # 执行撤回
+                try:
                     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
                     if isinstance(event, AiocqhttpMessageEvent):
                         client = event.bot
-                        
-                        # 撤回上一条消息
-                        payloads = {"message_id": target_msg_id}
-                        ret1 = await client.api.call_action('delete_msg', **payloads)
-                        logger.info(f"成功撤回目标消息 {target_msg_id}，返回: {ret1}")
-                        
-                        # 稍等一下再撤回 [recall] 本身
-                        await asyncio.sleep(0.5)
-                        
-                        # 撤回 [recall] 关键词消息
-                        payloads = {"message_id": recall_msg_id}
-                        ret2 = await client.api.call_action('delete_msg', **payloads)
-                        logger.info(f"成功撤回 [recall] 消息 {recall_msg_id}，返回: {ret2}")
-                        
-                        # 从记录中移除这两条消息
-                        if len(self.sent_messages[umo]) >= 2:
-                            self.sent_messages[umo].pop()  # 移除 [recall]
-                            self.sent_messages[umo].pop()  # 移除上一条消息
-                        
-                        # 停止事件传播，避免其他插件处理 [recall]
-                        event.stop_event()
-                        
-            except Exception as e:
-                logger.error(f"撤回消息失败: {e}")
-
-    @filter.after_message_sent()
-    async def record_sent_message(self, event: AstrMessageEvent):
-        """记录发送的消息 ID，以便后续撤回"""
-        try:
-            umo = event.unified_msg_origin
-            platform_name = event.get_platform_name()
-            
-            # 只记录支持撤回的平台
-            if platform_name not in ["aiocqhttp"]:
-                return
-            
-            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-            if isinstance(event, AiocqhttpMessageEvent):
-                # 初始化会话的消息列表
-                if umo not in self.sent_messages:
-                    self.sent_messages[umo] = []
-                
-                # 尝试从消息事件中获取 message_id
-                # 注意：这里需要根据实际的消息发送结果来获取 message_id
-                # 暂时使用占位符，实际使用时需要调整
-                message_id = getattr(event.message_obj, 'message_id', None)
-                
-                if message_id:
-                    timestamp = time.time()
-                    self.sent_messages[umo].append((message_id, timestamp))
-                    
-                    # 保持消息列表大小在限制内
-                    if len(self.sent_messages[umo]) > self.max_messages_per_session:
-                        self.sent_messages[umo].pop(0)
-                    
-                    logger.debug(f"记录消息 ID: {message_id}，会话: {umo}")
-                
-        except Exception as e:
-            logger.error(f"记录消息 ID 失败: {e}")
-
-    @filter.command("recall")
-    async def manual_recall(self, event: AstrMessageEvent):
-        """手动撤回上一条消息"""
-        umo = event.unified_msg_origin
-        platform_name = event.get_platform_name()
-        
-        # 检查是否支持撤回功能
-        if platform_name not in ["aiocqhttp"]:
-            yield event.plain_result(f"当前平台 {platform_name} 暂不支持消息撤回功能")
-            return
-        
-        # 检查是否有消息记录
-        if umo not in self.sent_messages or not self.sent_messages[umo]:
-            yield event.plain_result("没有可以撤回的消息记录")
-            return
-        
-        try:
-            # 获取最后一条消息 ID
-            message_id, timestamp = self.sent_messages[umo][-1]
-            
-            # 调用 QQ 协议端 API 撤回消息
-            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-            if isinstance(event, AiocqhttpMessageEvent):
-                client = event.bot
-                payloads = {"message_id": message_id}
-                ret = await client.api.call_action('delete_msg', **payloads)
-                
-                # 从记录中移除已撤回的消息
-                self.sent_messages[umo].pop()
-                
-                logger.info(f"手动撤回消息 {message_id}，返回: {ret}")
-                yield event.plain_result("✅ 已成功撤回上一条消息")
+                        ret = await client.api.call_action('delete_msg', message_id=message_id)
+                        logger.info(f"成功撤回消息 {message_id}, 返回: {ret}")
+                    else:
+                        logger.warning("消息类型不是 AiocqhttpMessageEvent，无法撤回")
+                except Exception as e:
+                    logger.error(f"撤回消息 {message_id} 失败: {e}", exc_info=True)
             else:
-                yield event.plain_result("消息类型错误，无法撤回")
-                
+                logger.warning("无法获取 message_id，撤回失败")
+
         except Exception as e:
-            logger.error(f"撤回消息失败: {e}")
-            yield event.plain_result(f"❌ 撤回消息失败: {str(e)}")
+            logger.error(f"处理撤回逻辑时出错: {e}", exc_info=True)
 
-    @filter.command("list_messages")
-    async def list_sent_messages(self, event: AstrMessageEvent):
-        """列出当前会话最近发送的消息记录"""
-        umo = event.unified_msg_origin
-        
-        if umo not in self.sent_messages or not self.sent_messages[umo]:
-            yield event.plain_result("当前会话没有消息记录")
-            return
-        
-        messages = self.sent_messages[umo]
-        msg_list = []
-        for i, (msg_id, timestamp) in enumerate(reversed(messages), 1):
-            time_str = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
-            msg_list.append(f"{i}. 消息ID: {msg_id} (发送时间: {time_str})")
-        
-        result_text = f"📝 最近发送的 {len(messages)} 条消息：\n" + "\n".join(msg_list)
-        yield event.plain_result(result_text)
-
-    @filter.command("help")
+    @filter.command("recall_help")
     async def show_help(self, event: AstrMessageEvent):
-        """显示撤回功能使用帮助"""
-        help_text = """
-📖 LLM 自主撤回功能使用指南
+        """显示使用帮助"""
+        help_text = """📖 LLM 自主撤回功能
 
 🤖 AI 使用方式：
-在你的 AI 人格提示词中添加：
-"当你需要撤回上一条消息时，发送 [recall]"
+在消息末尾添加 [recall] 标记即可自动撤回
 
-AI 发送 [recall] 后，会自动撤回上一条消息和 [recall] 本身。
+示例：
+AI: "我爱你[recall]"
+→ 发送"我爱你"后立即撤回
 
-👤 用户手动命令：
-- /recall - 手动撤回上一条消息
-- /list_messages - 查看消息历史
-- /help - 显示此帮助
+⚠️ 注意事项：
+- 仅支持 QQ 平台 (aiocqhttp)
+- [recall] 标记会被自动移除
+- 撤回延迟约 0.5 秒
 
-⚠️ 使用示例：
-用户：1+1等于几？
-AI：1+1等于3
-AI：[recall]
-[上一条消息被撤回]
-AI：抱歉，1+1等于2
-
-✅ 支持平台：QQ (aiocqhttp)
-"""
+💡 使用场景：
+- 发送了错误信息需要撤回
+- 测试消息后立即清理
+- 临时展示信息后撤回"""
         yield event.plain_result(help_text.strip())
 
     async def terminate(self):
-        """插件销毁时的清理工作"""
+        """插件卸载时的清理"""
         logger.info("ChatPro 插件已卸载")
-        self.sent_messages.clear()
+        StateManager._sessions.clear()
